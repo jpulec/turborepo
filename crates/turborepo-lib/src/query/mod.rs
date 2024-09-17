@@ -1,3 +1,6 @@
+mod file;
+mod package;
+
 use std::{io, sync::Arc};
 
 use async_graphql::{http::GraphiQLSource, *};
@@ -5,19 +8,27 @@ use async_graphql_axum::GraphQL;
 use axum::{response, response::IntoResponse, routing::get, Router};
 use itertools::Itertools;
 use miette::Diagnostic;
+use package::Package;
 use thiserror::Error;
 use tokio::{net::TcpListener, select};
-use turborepo_repository::package_graph::{PackageName, PackageNode};
+use turbo_trace::TraceError;
+use turbopath::AbsoluteSystemPathBuf;
+use turborepo_repository::package_graph::PackageName;
 
 use crate::{
+    query::file::File,
     run::{builder::RunBuilder, Run},
     signal::SignalHandler,
 };
 
 #[derive(Error, Debug, Diagnostic)]
 pub enum Error {
+    #[error("failed to get file dependencies")]
+    Trace(#[related] Vec<TraceError>),
     #[error("no signal handler")]
     NoSignalHandler,
+    #[error("file `{0}` not found")]
+    FileNotFound(String),
     #[error("failed to start GraphQL server")]
     Server(#[from] io::Error),
     #[error("package not found: {0}")]
@@ -26,6 +37,8 @@ pub enum Error {
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
     Run(#[from] crate::run::Error),
+    #[error(transparent)]
+    Path(#[from] turbopath::PathError),
 }
 
 pub struct Query {
@@ -35,53 +48,6 @@ pub struct Query {
 impl Query {
     pub fn new(run: Run) -> Self {
         Self { run: Arc::new(run) }
-    }
-}
-
-struct Package {
-    run: Arc<Run>,
-    name: PackageName,
-}
-
-impl Package {
-    fn direct_dependents_count(&self) -> usize {
-        self.run
-            .pkg_dep_graph()
-            .immediate_ancestors(&PackageNode::Workspace(self.name.clone()))
-            .map_or(0, |pkgs| pkgs.len())
-    }
-
-    fn direct_dependencies_count(&self) -> usize {
-        self.run
-            .pkg_dep_graph()
-            .immediate_dependencies(&PackageNode::Workspace(self.name.clone()))
-            .map_or(0, |pkgs| pkgs.len())
-    }
-
-    fn indirect_dependents_count(&self) -> usize {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-
-        self.run.pkg_dep_graph().ancestors(&node).len() - self.direct_dependents_count()
-    }
-
-    fn indirect_dependencies_count(&self) -> usize {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-
-        self.run.pkg_dep_graph().dependencies(&node).len() - self.direct_dependencies_count()
-    }
-
-    fn all_dependents_count(&self) -> usize {
-        self.run
-            .pkg_dep_graph()
-            .ancestors(&PackageNode::Workspace(self.name.clone()))
-            .len()
-    }
-
-    fn all_dependencies_count(&self) -> usize {
-        self.run
-            .pkg_dep_graph()
-            .dependencies(&PackageNode::Workspace(self.name.clone()))
-            .len()
     }
 }
 
@@ -321,6 +287,16 @@ impl Query {
         })
     }
 
+    async fn file(&self, path: String) -> Result<File, Error> {
+        let abs_path = AbsoluteSystemPathBuf::from_unknown(&self.run.repo_root(), path);
+
+        if !abs_path.exists() {
+            return Err(Error::FileNotFound(abs_path.to_string()));
+        }
+
+        Ok(File::new(self.run.clone(), abs_path))
+    }
+
     /// Gets a list of packages that match the given filter
     async fn packages(&self, filter: Option<PackagePredicate>) -> Result<Vec<Package>, Error> {
         let Some(filter) = filter else {
@@ -345,135 +321,6 @@ impl Query {
                 name: name.clone(),
             })
             .filter(|pkg| filter.check(pkg))
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-}
-
-#[Object]
-impl Package {
-    /// The name of the package
-    async fn name(&self) -> String {
-        self.name.to_string()
-    }
-
-    /// The path to the package, relative to the repository root
-    async fn path(&self) -> Result<String, Error> {
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .package_info(&self.name)
-            .ok_or_else(|| Error::PackageNotFound(self.name.clone()))?
-            .package_path()
-            .to_string())
-    }
-
-    /// The upstream packages that have this package as a direct dependency
-    async fn direct_dependents(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .immediate_ancestors(&node)
-            .iter()
-            .flatten()
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-
-    /// The downstream packages that directly depend on this package
-    async fn direct_dependencies(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .immediate_dependencies(&node)
-            .iter()
-            .flatten()
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-
-    async fn all_dependents(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .ancestors(&node)
-            .iter()
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-
-    async fn all_dependencies(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .dependencies(&node)
-            .iter()
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-
-    /// The downstream packages that depend on this package, indirectly
-    async fn indirect_dependents(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        let immediate_dependents = self
-            .run
-            .pkg_dep_graph()
-            .immediate_ancestors(&node)
-            .ok_or_else(|| Error::PackageNotFound(self.name.clone()))?;
-
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .ancestors(&node)
-            .iter()
-            .filter(|package| !immediate_dependents.contains(*package))
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
-            .sorted_by(|a, b| a.name.cmp(&b.name))
-            .collect())
-    }
-
-    /// The upstream packages that this package depends on, indirectly
-    async fn indirect_dependencies(&self) -> Result<Vec<Package>, Error> {
-        let node: PackageNode = PackageNode::Workspace(self.name.clone());
-        let immediate_dependencies = self
-            .run
-            .pkg_dep_graph()
-            .immediate_dependencies(&node)
-            .ok_or_else(|| Error::PackageNotFound(self.name.clone()))?;
-
-        Ok(self
-            .run
-            .pkg_dep_graph()
-            .dependencies(&node)
-            .iter()
-            .filter(|package| !immediate_dependencies.contains(*package))
-            .map(|package| Package {
-                run: self.run.clone(),
-                name: package.as_package_name().clone(),
-            })
             .sorted_by(|a, b| a.name.cmp(&b.name))
             .collect())
     }
